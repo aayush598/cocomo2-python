@@ -1,109 +1,138 @@
 #!/usr/bin/env python3
 """
-main.py – COCOMO II Estimation CLI Tool
-=======================================
+main.py – COCOMO II FastAPI Service
+===================================
 
-Estimates Person-Months (PM), Schedule (TDEV), and Team Size
-using full COCOMO II.2000 (Post-Architecture) model.
-
-Integrates:
- • sizing.py       – SLOC calculation from FP or manual input
- • reuse.py        – ESLOC estimation for reused code
- • effort.py       – Effort estimation
- • schedule.py     – Schedule estimation
- • constants.py    – Default EMs & SFs
+Exposes endpoints to estimate:
+ • SLOC from Function Points
+ • ESLOC from reused code
+ • Adjusted SLOC with REVL
+ • Effort (PM) and Schedule (TDEV)
 
 Author : Aayush Gid | License : MIT
 """
 
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
+from typing import List, Literal, Optional
+
 from cocomo.constants import DEFAULT_EMS, DEFAULT_SFS
-from cocomo.sizing import weight_fp_items, ufp_to_sloc, compute_size, FPCount, FPType
-from cocomo.reuse import (
-    calc_esloc, ReuseParams, su_from_rating, aa_from_rating, unfm_from_rating
-)
+from cocomo.sizing import FPCount, FPType, weight_fp_items, ufp_to_sloc, compute_size
+from cocomo.reuse import ReuseParams, calc_esloc, su_from_rating, aa_from_rating, unfm_from_rating
 from cocomo.effort import calculate_effort
 from cocomo.schedule import calculate_schedule
 
-# For CLI input
-def get_float(prompt, default=None):
-    try:
-        inp = input(prompt).strip()
-        return float(inp) if inp else default
-    except Exception:
-        return default
+app = FastAPI(title="COCOMO II Estimation API", version="1.0")
 
-def get_rating(prompt, options, default="N"):
-    r = input(f"{prompt} {options} (default {default}): ").strip().upper()
-    return r if r in options else default
+# ─────────────────────────────────────────────────────────────
+# Models
+# ─────────────────────────────────────────────────────────────
 
-# ───────────────────────────────────────────────────────────────
-# Main CLI
-# ───────────────────────────────────────────────────────────────
+class FPItemInput(BaseModel):
+    fp_type: Literal["ILF", "EIF", "EI", "EO", "EQ"]
+    det: int
+    ftr_or_ret: int
 
-def main():
-    print("┌────────────────────────────────────────────┐")
-    print("│        COCOMO II.2000 Estimator CLI        │")
-    print("└────────────────────────────────────────────┘\n")
+class SizingRequest(BaseModel):
+    fp_items: List[FPItemInput]
+    language: str
 
-    # 1. Project Sizing
-    sizing_mode = input("Enter sizing mode: [1] KSLOC manually  [2] via Function Points: ").strip()
+class ReuseRequest(BaseModel):
+    asloc: float
+    dm: float
+    cm: float
+    im: float
+    su_rating: Literal["VL", "L", "N", "H", "VH"]
+    aa_rating: Literal["0", "2", "4", "6", "8"]
+    unfm_rating: Literal["CF", "MF", "SF", "CFa", "MU", "CU"]
+    at: float = 0.0
 
-    if sizing_mode == "2":
-        # Tiny hardcoded example
-        print("\nExample FP counts:")
-        fp_items = [
-            FPCount(FPType.ILF, det=25, ftr_or_ret=3),
-            FPCount(FPType.EI, det=10, ftr_or_ret=2),
-            FPCount(FPType.EO, det=22, ftr_or_ret=4),
+class SLOCAdjustmentRequest(BaseModel):
+    new_sloc: float
+    adapted_esloc: float = 0.0
+    revl_percent: float = 0.0
+
+class EffortScheduleRequest(BaseModel):
+    sloc_ksloc: float
+    sced_rating: Literal["VL", "L", "N", "H", "VH"] = "N"
+
+# ─────────────────────────────────────────────────────────────
+# Endpoints
+# ─────────────────────────────────────────────────────────────
+
+@app.post("/size/from_function_points")
+def size_from_fp(request: SizingRequest):
+    fp_counts = [FPCount(fp_type=FPType(it.fp_type), det=it.det, ftr_or_ret=it.ftr_or_ret) for it in request.fp_items]
+    ufp = weight_fp_items(fp_counts)
+    sloc = ufp_to_sloc(ufp, request.language)
+    return {
+        "ufp": ufp,
+        "sloc": sloc
+    }
+
+@app.post("/size/from_reuse")
+def size_from_reuse(request: ReuseRequest):
+    su = su_from_rating(request.su_rating)
+    aa = aa_from_rating(request.aa_rating)
+    unfm = unfm_from_rating(request.unfm_rating)
+
+    reuse_params = ReuseParams(
+        asloc=request.asloc,
+        dm=request.dm,
+        cm=request.cm,
+        im=request.im,
+        su=su,
+        aa=aa,
+        unfm=unfm,
+        at=request.at
+    )
+
+    esloc = calc_esloc(reuse_params)
+    return {"esloc": esloc}
+
+@app.post("/size/adjust_with_revl")
+def adjust_with_revl(request: SLOCAdjustmentRequest):
+    result = compute_size(
+        new_sloc=request.new_sloc,
+        adapted_esloc=request.adapted_esloc,
+        revl_percent=request.revl_percent
+    )
+    return {
+        "sloc_total": result.sloc,
+        "sloc_after_revl": result.sloc_after_revl
+    }
+
+@app.post("/estimate/effort_schedule")
+def estimate_effort_schedule(request: EffortScheduleRequest):
+    pm, E = calculate_effort(
+        size_ksloc=request.sloc_ksloc,
+        ems=DEFAULT_EMS,
+        sfs=DEFAULT_SFS
+    )
+    tdev = calculate_schedule(
+        pm=pm,
+        E=E,
+        sced_rating=request.sced_rating,
+        pm_includes_sced=True
+    )
+    return {
+        "person_months": round(pm, 2),
+        "development_time_months": round(tdev, 2),
+        "avg_team_size": round(pm / tdev, 2)
+    }
+
+# ─────────────────────────────────────────────────────────────
+# Root
+# ─────────────────────────────────────────────────────────────
+
+@app.get("/")
+def root():
+    return {
+        "message": "Welcome to COCOMO II Estimation API 🚀",
+        "endpoints": [
+            "/size/from_function_points",
+            "/size/from_reuse",
+            "/size/adjust_with_revl",
+            "/estimate/effort_schedule"
         ]
-        ufp = weight_fp_items(fp_items)
-        language = input("Target language (e.g., Java, C++): ").strip().lower()
-        new_sloc = ufp_to_sloc(ufp, language)
-        print(f"UFP = {ufp}, SLOC = {new_sloc:.0f}")
-    else:
-        new_sloc = get_float("Enter size of new code in KSLOC: ", default=100.0) * 1000
-
-    # 2. Reused code
-    use_reuse = input("\nReuse code? [y/N]: ").strip().lower() == "y"
-    reused_esloc = 0
-    if use_reuse:
-        asloc = get_float("Adapted SLOC (ASLOC): ", 10000)
-        dm = get_float("Design modified % (DM): ", 20)
-        cm = get_float("Code modified % (CM): ", 30)
-        im = get_float("Integration effort % (IM): ", 40)
-        su = su_from_rating(get_rating("Software Understanding (SU)", list("VL H N L VH".split())))
-        aa = aa_from_rating(get_rating("Assessment/Assimilation (AA)", ["0", "2", "4", "6", "8"]))
-        unfm = unfm_from_rating(get_rating("Programmer Unfamiliarity (UNFM)", ["CF", "MF", "SF", "CFa", "MU", "CU"]))
-        at = get_float("Auto translation % (AT): ", 25)
-
-        reuse_params = ReuseParams(asloc=asloc, dm=dm, cm=cm, im=im, su=su, aa=aa, unfm=unfm, at=at)
-        reused_esloc = calc_esloc(reuse_params)
-        print(f"→ Equivalent SLOC from reuse = {reused_esloc:,.0f}")
-
-    # 3. Requirements Evolution & Volatility
-    revl = get_float("\nREVL % (default 10): ", 10)
-
-    # 4. Final SLOC with REVL
-    size_result = compute_size(new_sloc, reused_esloc, revl_percent=revl)
-    total_ksloc = size_result.sloc_after_revl / 1000
-
-    # 5. Effort estimation
-    print("\nCalculating effort using default SFs and EMs (Nominal ratings)...")
-    ems = DEFAULT_EMS.copy()
-    sfs = DEFAULT_SFS.copy()
-    pm, E = calculate_effort(total_ksloc, ems=ems, sfs=sfs)
-
-    # 6. Schedule estimation
-    sced = get_rating("Schedule Compression (SCED)", list("VL L N H VH".split()), default="N")
-    tdev = calculate_schedule(pm, E, sced_rating=sced, pm_includes_sced=True)
-
-    # 7. Report
-    print("\n─────────────── Estimation Summary ───────────────")
-    print(f"Total SLOC (after REVL):    {size_result.sloc_after_revl:,.0f}")
-    print(f"Effort (PM):                {pm:.2f}")
-    print(f"Development Time (months):  {tdev:.2f}")
-    print(f"Average Team Size:          {pm / tdev:.2f}")
-    print("─────────────────────────────────────────────────")
-
-if __name__ == "__main__":
-    main()
+    }
